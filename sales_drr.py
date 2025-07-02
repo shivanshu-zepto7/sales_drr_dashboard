@@ -70,12 +70,14 @@ sales_data AS (
     si.product_name AS campaign_product_name,
     SUM(mu.quantity) AS total_sales,
     SUM(CASE 
-          WHEN mu.day >= CURRENT_DATE - INTERVAL 3 DAY 
-          THEN mu.quantity ELSE 0 
+          WHEN mu.day >= CURRENT_DATE - INTERVAL '3' DAY 
+          THEN mu.quantity 
+          ELSE 0 
         END) AS sales_3day
   FROM gold.zepto.master_marketing_user_gppo mu
   JOIN base_pvids bp ON mu.product_variant_id = bp.pvid
-  LEFT JOIN gold.zepto.sku_info si ON mu.product_variant_id = si.product_variant_id
+  LEFT JOIN gold.zepto.sku_info si
+    ON mu.product_variant_id = si.product_variant_id
   WHERE mu.gsv = 0
   GROUP BY mu.product_variant_id, si.product_name
 ),
@@ -85,7 +87,8 @@ grn_data AS (
     SUM(grn_qty) AS mh_grn
   FROM gold.ops.pl_po_details podet
   JOIN base_pvids bp ON LOWER(podet.sku) = LOWER(bp.pvid)
-  LEFT JOIN gold.zepto.sku_info s ON LOWER(podet.sku) = LOWER(s.product_variant_id)
+  LEFT JOIN gold.zepto.sku_info s 
+    ON LOWER(podet.sku) = LOWER(s.product_variant_id)
   LEFT JOIN (
     SELECT externpocode, MAX(grn_date) AS po_grn_date 
     FROM gold.ops.pl_po_details 
@@ -101,8 +104,9 @@ inventory_data AS (
     SUM(COALESCE(hs.good_available + hs.cross_dock_available, 0)) AS retail_inventory
   FROM gold.ops.pl_inventory_all_legs hs
   JOIN base_pvids bp ON hs.product_variant_id = bp.pvid
-  LEFT JOIN gold.zepto.stores s ON hs.store_id = s.store_id
-  LEFT JOIN silver.oms.store_product sp 
+  LEFT JOIN gold.zepto.stores s
+    ON hs.store_id = s.store_id
+  LEFT JOIN silver.oms.store_product sp
     ON hs.store_id = sp.store_id AND hs.product_variant_id = sp.product_variant_id
   WHERE hs.datestr = CURRENT_DATE
     AND hs.store_type = 'RETAIL_STORE'
@@ -111,14 +115,17 @@ inventory_data AS (
     AND store_active_status = TRUE
     AND store_live_status = TRUE
     AND sp.is_active = TRUE
-    AND hour = (
-      SELECT MAX(hour) 
-      FROM gold.ops.pl_inventory_all_legs 
-      WHERE datestr = CURRENT_DATE
-    )
+    AND hour = (SELECT MAX(hour) FROM gold.ops.pl_inventory_all_legs WHERE datestr = CURRENT_DATE)
   GROUP BY hs.product_variant_id
 )
+,non_zero_gsv AS (
+  SELECT DISTINCT mu.product_variant_id AS pvid
+  FROM gold.zepto.master_marketing_user_gppo mu
+  JOIN base_pvids bp ON mu.product_variant_id = bp.pvid
+  WHERE mu.gsv != 0
+)
 
+-- Final Output
 SELECT 
   s.pvid AS Product_variant_id,
   s.campaign_product_name AS CAMPAIGN_PRODUCT_NAME,
@@ -134,7 +141,12 @@ SELECT
 FROM sales_data s
 LEFT JOIN grn_data g ON LOWER(s.pvid) = g.pvid
 LEFT JOIN inventory_data inv ON s.pvid = inv.pvid
-WHERE COALESCE(g.mh_grn, 0) - COALESCE(s.total_sales, 0) < 100
+WHERE COALESCE(g.mh_grn, 0) - COALESCE(s.total_sales, 0) > 100
+AND coalesce(g.mh_grn) != 0
+AND NOT (
+    COALESCE(s.total_sales, 0) = 0
+    AND s.pvid IN (SELECT pvid FROM non_zero_gsv)
+  )
 ORDER BY Sales_Percent ASC
 """)
 
