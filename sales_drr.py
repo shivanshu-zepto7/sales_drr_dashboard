@@ -138,4 +138,4 @@ ORDER BY Sales_Percent ASC
 """)
 
 # Step 4: Export to another Google Sheet
-write_sheet(query_df, '1cVCnh-GdUxjbZLj9LK9W-X3cjx0CqqHp1c121wj0Uq8', 'Final Data')
+write_sheet(query_df, '16CP55NRyOMe4bSLXosVSKjCRaoek8vdMq0-Fo5ik70k', 'raw')
