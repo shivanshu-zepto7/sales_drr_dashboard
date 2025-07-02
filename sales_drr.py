@@ -62,25 +62,33 @@ data_df.write.mode('overwrite').saveAsTable("gold.scratch.drr_test")
 # Step 3: Run the logic
 query_df = spark.sql("""
 WITH base_pvids AS (
-  SELECT pvid.pvid FROM gold.scratch.drr_test AS pvid
+  SELECT DISTINCT pvid FROM gold.scratch.drr_test
 ),
+
 sales_data AS (
   SELECT 
     mu.product_variant_id AS pvid,
     si.product_name AS campaign_product_name,
+    si.product_type,
     SUM(mu.quantity) AS total_sales,
     SUM(CASE 
           WHEN mu.day >= CURRENT_DATE - INTERVAL '3' DAY 
           THEN mu.quantity 
           ELSE 0 
-        END) AS sales_3day
+        END) AS sales_3day,
+    SUM(CASE 
+          WHEN mu.day = CURRENT_DATE - INTERVAL '1' DAY 
+          THEN mu.quantity 
+          ELSE 0 
+        END) AS sales_1day
   FROM gold.zepto.master_marketing_user_gppo mu
   JOIN base_pvids bp ON mu.product_variant_id = bp.pvid
   LEFT JOIN gold.zepto.sku_info si
     ON mu.product_variant_id = si.product_variant_id
   WHERE mu.gsv = 0
-  GROUP BY mu.product_variant_id, si.product_name
+  GROUP BY mu.product_variant_id, si.product_name, si.product_type
 ),
+
 grn_data AS (
   SELECT 
     LOWER(podet.sku) AS pvid,
@@ -98,12 +106,13 @@ grn_data AS (
     AND grn_qty > 0
   GROUP BY LOWER(podet.sku)
 ),
-inventory_data AS (
+
+retail_inventory AS (
   SELECT 
-    hs.product_variant_id AS pvid,
-    SUM(COALESCE(hs.good_available + hs.cross_dock_available, 0)) AS retail_inventory
+    LOWER(hs.product_variant_id) AS pvid,
+    SUM(COALESCE(hs.good_available + hs.cross_dock_available, 0)) AS ds_inv
   FROM gold.ops.pl_inventory_all_legs hs
-  JOIN base_pvids bp ON hs.product_variant_id = bp.pvid
+  JOIN base_pvids bp ON LOWER(hs.product_variant_id) = LOWER(bp.pvid)
   LEFT JOIN gold.zepto.stores s
     ON hs.store_id = s.store_id
   LEFT JOIN silver.oms.store_product sp
@@ -115,10 +124,32 @@ inventory_data AS (
     AND store_active_status = TRUE
     AND store_live_status = TRUE
     AND sp.is_active = TRUE
-    AND hour = (SELECT MAX(hour) FROM gold.ops.pl_inventory_all_legs WHERE datestr = CURRENT_DATE)
-  GROUP BY hs.product_variant_id
-)
-,non_zero_gsv AS (
+    AND hs.hour = (
+      SELECT MAX(hour) 
+      FROM gold.ops.pl_inventory_all_legs 
+      WHERE datestr = CURRENT_DATE
+    )
+  GROUP BY LOWER(hs.product_variant_id)
+),
+
+warehouse_inventory AS (
+  SELECT 
+    LOWER(hs.product_variant_id) AS pvid,
+    SUM(COALESCE(hs.good_available + hs.cross_dock_available, 0)) AS mh_inv
+  FROM gold.ops.pl_inventory_all_legs hs
+  JOIN base_pvids bp ON LOWER(hs.product_variant_id) = LOWER(bp.pvid)
+  WHERE hs.datestr = CURRENT_DATE
+    AND hs.store_type = 'WAREHOUSE'
+    AND hs.city_name <> 'Test City'
+    AND hs.hour = (
+      SELECT MAX(hour) 
+      FROM gold.ops.pl_inventory_all_legs 
+      WHERE datestr = CURRENT_DATE
+    )
+  GROUP BY LOWER(hs.product_variant_id)
+),
+
+non_zero_gsv AS (
   SELECT DISTINCT mu.product_variant_id AS pvid
   FROM gold.zepto.master_marketing_user_gppo mu
   JOIN base_pvids bp ON mu.product_variant_id = bp.pvid
@@ -136,14 +167,21 @@ SELECT
   ROUND(s.sales_3day * 1.0 / 3, 2) AS DRR,
   CASE 
     WHEN s.sales_3day = 0 THEN 'infinity'
-    ELSE ROUND(COALESCE(inv.retail_inventory, 0) / (s.sales_3day * 1.0 / 3), 2)
-  END AS DOH
+    ELSE ROUND(COALESCE(ds.ds_inv, 0) / (s.sales_3day * 1.0 / 3), 2)
+  END AS DOH,
+  s.product_type AS PRODUCT_TYPE,
+  COALESCE(ds.ds_inv, 0) + COALESCE(mh.mh_inv, 0) AS CURRENT_INV,
+  CASE 
+  WHEN s.sales_3day = 0 THEN 'Not Live'
+  ELSE 'Live'
+END AS CAMPAIGN_STATUS
 FROM sales_data s
 LEFT JOIN grn_data g ON LOWER(s.pvid) = g.pvid
-LEFT JOIN inventory_data inv ON s.pvid = inv.pvid
+LEFT JOIN retail_inventory ds ON LOWER(s.pvid) = ds.pvid
+LEFT JOIN warehouse_inventory mh ON LOWER(s.pvid) = mh.pvid
 WHERE COALESCE(g.mh_grn, 0) - COALESCE(s.total_sales, 0) > 100
-AND coalesce(g.mh_grn) != 0
-AND NOT (
+  AND COALESCE(g.mh_grn) != 0
+  AND NOT (
     COALESCE(s.total_sales, 0) = 0
     AND s.pvid IN (SELECT pvid FROM non_zero_gsv)
   )
