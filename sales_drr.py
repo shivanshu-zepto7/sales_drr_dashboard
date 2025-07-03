@@ -89,34 +89,38 @@ sales_data AS (
   GROUP BY mu.product_variant_id, si.product_name, si.product_type
 ),
 
-grn_data AS (
+grn_gift AS (
   SELECT 
     LOWER(podet.sku) AS pvid,
-    SUM(grn_qty) AS mh_grn
+    SUM(grn_qty) AS mh_grn_gift
   FROM gold.ops.pl_po_details podet
   JOIN base_pvids bp ON LOWER(podet.sku) = LOWER(bp.pvid)
-  LEFT JOIN gold.zepto.sku_info s 
-    ON LOWER(podet.sku) = LOWER(s.product_variant_id)
-  LEFT JOIN (
-    SELECT externpocode, MAX(grn_date) AS po_grn_date 
-    FROM gold.ops.pl_po_details 
-    GROUP BY 1
-  ) grn_po ON podet.externpocode = grn_po.externpocode
-  WHERE podet.location_type = 'WAREHOUSE'
+  JOIN gold.zepto.sku_info si ON LOWER(podet.sku) = LOWER(si.product_variant_id)
+  WHERE si.product_type = 'GIFT'
+    AND podet.location_type = 'WAREHOUSE'
     AND grn_qty > 0
   GROUP BY LOWER(podet.sku)
+),
+
+grn_sellable AS (
+  SELECT 
+    LOWER(drr.pvid) AS pvid,
+    SUM(drr.quantity) AS mh_grn_sellable
+  FROM gold.scratch.drr_test drr
+  JOIN gold.zepto.sku_info si ON LOWER(drr.pvid) = LOWER(si.product_variant_id)
+  WHERE si.product_type != 'GIFT'
+  GROUP BY LOWER(drr.pvid)
 ),
 
 retail_inventory AS (
   SELECT 
     LOWER(hs.product_variant_id) AS pvid,
-    SUM(COALESCE(hs.good_available + hs.cross_dock_available, 0)) AS ds_inv
+    SUM(COALESCE(hs.good_available + hs.cross_dock_available, 0)) AS ds_inv_retail
   FROM gold.ops.pl_inventory_all_legs hs
   JOIN base_pvids bp ON LOWER(hs.product_variant_id) = LOWER(bp.pvid)
-  LEFT JOIN gold.zepto.stores s
-    ON hs.store_id = s.store_id
-  LEFT JOIN silver.oms.store_product sp
-    ON hs.store_id = sp.store_id AND hs.product_variant_id = sp.product_variant_id
+  LEFT JOIN gold.zepto.stores s ON hs.store_id = s.store_id
+  LEFT JOIN silver.oms.store_product sp ON hs.store_id = sp.store_id 
+      AND hs.product_variant_id = sp.product_variant_id
   WHERE hs.datestr = CURRENT_DATE
     AND hs.store_type = 'RETAIL_STORE'
     AND s.city_name <> 'Test City'
@@ -124,29 +128,33 @@ retail_inventory AS (
     AND store_active_status = TRUE
     AND store_live_status = TRUE
     AND sp.is_active = TRUE
-    AND hs.hour = (
-      SELECT MAX(hour) 
-      FROM gold.ops.pl_inventory_all_legs 
-      WHERE datestr = CURRENT_DATE
-    )
+    AND hs.hour = (SELECT MAX(hour) 
+                   FROM gold.ops.pl_inventory_all_legs 
+                   WHERE datestr = CURRENT_DATE)
   GROUP BY LOWER(hs.product_variant_id)
 ),
 
 warehouse_inventory AS (
   SELECT 
     LOWER(hs.product_variant_id) AS pvid,
-    SUM(COALESCE(hs.good_available + hs.cross_dock_available, 0)) AS mh_inv
+    SUM(COALESCE(hs.good_available + hs.cross_dock_available, 0)) AS ds_inv_wh
   FROM gold.ops.pl_inventory_all_legs hs
   JOIN base_pvids bp ON LOWER(hs.product_variant_id) = LOWER(bp.pvid)
   WHERE hs.datestr = CURRENT_DATE
     AND hs.store_type = 'WAREHOUSE'
     AND hs.city_name <> 'Test City'
-    AND hs.hour = (
-      SELECT MAX(hour) 
-      FROM gold.ops.pl_inventory_all_legs 
-      WHERE datestr = CURRENT_DATE
-    )
+    AND hs.hour = (SELECT MAX(hour) 
+                   FROM gold.ops.pl_inventory_all_legs 
+                   WHERE datestr = CURRENT_DATE)
   GROUP BY LOWER(hs.product_variant_id)
+),
+
+total_inventory AS (
+  SELECT 
+    COALESCE(r.pvid, w.pvid) AS pvid,
+    COALESCE(r.ds_inv_retail, 0) + COALESCE(w.ds_inv_wh, 0) AS ds_inv
+  FROM retail_inventory r
+  FULL OUTER JOIN warehouse_inventory w ON r.pvid = w.pvid
 ),
 
 non_zero_gsv AS (
@@ -154,39 +162,97 @@ non_zero_gsv AS (
   FROM gold.zepto.master_marketing_user_gppo mu
   JOIN base_pvids bp ON mu.product_variant_id = bp.pvid
   WHERE mu.gsv != 0
+),
+
+campaign_dates AS (
+  SELECT 
+    LOWER(pvid) AS pvid,
+    MAX(campaign_end_date) AS campaign_end_date
+  FROM gold.scratch.drr_test
+  GROUP BY LOWER(pvid)
+),
+
+raw_data AS (
+  SELECT 
+    s.pvid AS Product_variant_id,
+    s.campaign_product_name AS CAMPAIGN_PRODUCT_NAME,
+    s.total_sales AS SALES,
+    COALESCE(
+      CASE 
+        WHEN s.product_type = 'GIFT' THEN ggift.mh_grn_gift
+        ELSE gsell.mh_grn_sellable
+      END, 0
+    ) AS MH_GRN,
+    ROUND(s.total_sales * 1.0 / NULLIF(
+      CASE 
+        WHEN s.product_type = 'GIFT' THEN ggift.mh_grn_gift
+        ELSE gsell.mh_grn_sellable
+      END, 0
+    ), 4) AS Sales_Percent,
+    s.sales_3day AS SALES_3DAYS,
+    ROUND(s.sales_3day * 1.0 / 3, 2) AS DRR,
+    CASE 
+      WHEN s.sales_3day = 0 THEN 'infinity'
+      ELSE ROUND(COALESCE(inv.ds_inv, 0) / (s.sales_3day * 1.0 / 3), 2)
+    END AS DOH,
+    s.product_type AS PRODUCT_TYPE,
+    CASE 
+      WHEN s.product_type = 'GIFT' THEN COALESCE(inv.ds_inv, 0)
+      ELSE COALESCE(
+        CASE 
+          WHEN s.product_type = 'GIFT' THEN ggift.mh_grn_gift
+          ELSE gsell.mh_grn_sellable
+        END, 0
+      ) - COALESCE(s.total_sales, 0)
+    END AS CURRENT_INV,
+    CASE 
+      WHEN s.sales_3day = 0 THEN 'Not Live'
+      ELSE 'Live'
+    END AS CAMPAIGN_STATUS,
+    cd.campaign_end_date AS CAMPAIGN_END_DATE,
+    DATEDIFF(cd.campaign_end_date, CURRENT_DATE) AS DAYS_REMAINING
+  FROM sales_data s
+  LEFT JOIN grn_gift ggift ON LOWER(s.pvid) = ggift.pvid
+  LEFT JOIN grn_sellable gsell ON LOWER(s.pvid) = gsell.pvid
+  LEFT JOIN total_inventory inv ON LOWER(s.pvid) = inv.pvid
+  LEFT JOIN campaign_dates cd ON LOWER(s.pvid) = cd.pvid
+  WHERE COALESCE(
+          CASE 
+            WHEN s.product_type = 'GIFT' THEN ggift.mh_grn_gift
+            ELSE gsell.mh_grn_sellable
+          END, 0
+        ) - s.total_sales > 100
+    AND COALESCE(
+          CASE 
+            WHEN s.product_type = 'GIFT' THEN ggift.mh_grn_gift
+            ELSE gsell.mh_grn_sellable
+          END, 0
+        ) != 0
+    AND NOT (
+      s.total_sales = 0 AND s.pvid IN (SELECT pvid FROM non_zero_gsv)
+    )
+    AND COALESCE(inv.ds_inv, 0) >= 100
+),
+
+deduped AS (
+  SELECT * FROM (
+    SELECT *,
+           ROW_NUMBER() OVER (
+             PARTITION BY Product_variant_id, CAMPAIGN_PRODUCT_NAME, SALES, MH_GRN, Sales_Percent,
+                          SALES_3DAYS, DRR, DOH, PRODUCT_TYPE, CURRENT_INV, CAMPAIGN_STATUS,
+                          CAMPAIGN_END_DATE, DAYS_REMAINING
+             ORDER BY Product_variant_id
+           ) AS rn
+    FROM raw_data
+  ) sub
+  WHERE rn = 1
 )
 
--- Final Output
-SELECT 
-  s.pvid AS Product_variant_id,
-  s.campaign_product_name AS CAMPAIGN_PRODUCT_NAME,
-  s.total_sales AS SALES,
-  COALESCE(g.mh_grn, 0) AS MH_GRN,
-  ROUND(COALESCE(s.total_sales, 0) * 1.0 / NULLIF(g.mh_grn, 0), 4) AS Sales_Percent,
-  s.sales_3day AS SALES_3DAYS,
-  ROUND(s.sales_3day * 1.0 / 3, 2) AS DRR,
-  CASE 
-    WHEN s.sales_3day = 0 THEN 'infinity'
-    ELSE ROUND(COALESCE(ds.ds_inv, 0) / (s.sales_3day * 1.0 / 3), 2)
-  END AS DOH,
-  s.product_type AS PRODUCT_TYPE,
-  COALESCE(ds.ds_inv, 0) + COALESCE(mh.mh_inv, 0) AS CURRENT_INV,
-  CASE 
-  WHEN s.sales_3day = 0 THEN 'Not Live'
-  ELSE 'Live'
-END AS CAMPAIGN_STATUS
-FROM sales_data s
-LEFT JOIN grn_data g ON LOWER(s.pvid) = g.pvid
-LEFT JOIN retail_inventory ds ON LOWER(s.pvid) = ds.pvid
-LEFT JOIN warehouse_inventory mh ON LOWER(s.pvid) = mh.pvid
-WHERE COALESCE(g.mh_grn, 0) - COALESCE(s.total_sales, 0) > 100
-  AND COALESCE(g.mh_grn) != 0
-  AND NOT (
-    COALESCE(s.total_sales, 0) = 0
-    AND s.pvid IN (SELECT pvid FROM non_zero_gsv)
-  )
+SELECT Product_variant_id, CAMPAIGN_PRODUCT_NAME, SALES, MH_GRN, Sales_Percent,
+       SALES_3DAYS, DRR, DOH, PRODUCT_TYPE, CURRENT_INV, CAMPAIGN_STATUS,
+       CAMPAIGN_END_DATE, DAYS_REMAINING
+FROM deduped
 ORDER BY Sales_Percent ASC
 """)
-
 # Step 4: Export to another Google Sheet
 write_sheet(query_df, '16CP55NRyOMe4bSLXosVSKjCRaoek8vdMq0-Fo5ik70k', 'raw')
